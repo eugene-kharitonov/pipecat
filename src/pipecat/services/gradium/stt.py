@@ -41,9 +41,14 @@ from pipecat.utils.deprecation import deprecated
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
 
-# Seconds to wait after a "flushed" message for trailing text tokens to arrive
-# before finalizing the transcription.
-TRANSCRIPT_AGGREGATION_DELAY = 0.1
+# How long to wait after a "flushed" message for trailing text tokens to arrive
+# before finalizing the transcription. Scaled from the model's processing delay
+# (delay_in_frames): each frame is FRAME_DURATION seconds, and TIME_SCALE is the
+# fraction of that delay window we wait for the tail to land.
+FRAME_DURATION = 0.08  # seconds per audio frame (80ms)
+TIME_SCALE = 0.35
+# Server-side default frame delay, used when delay_in_frames is not set explicitly.
+DEFAULT_DELAY_IN_FRAMES = 10
 
 
 def _input_format_from_encoding(encoding: str, sample_rate: int) -> str:
@@ -238,6 +243,10 @@ class GradiumSTTService(WebsocketSTTService):
         self._audio_buffer = bytearray()
         self._chunk_size_ms = 80
         self._chunk_size_bytes = 0
+
+        # Effective model delay in frames; drives the transcript aggregation
+        # window. Falls back to the server default when not set explicitly.
+        self._delay_in_frames = self._settings.delay_in_frames or DEFAULT_DELAY_IN_FRAMES
 
         # Accumulates text fragments within a turn. Each "text" message
         # appends to this list. On "flushed" a short aggregation delay
@@ -513,7 +522,7 @@ class GradiumSTTService(WebsocketSTTService):
 
     async def _transcript_aggregation_handler(self):
         """Wait for trailing tokens then finalize the accumulated transcription."""
-        await asyncio.sleep(TRANSCRIPT_AGGREGATION_DELAY)
+        await asyncio.sleep(self._delay_in_frames * FRAME_DURATION * TIME_SCALE)
         await self._finalize_accumulated_text()
 
     async def _finalize_accumulated_text(self):
