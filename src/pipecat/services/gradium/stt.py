@@ -44,6 +44,17 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 # before finalizing the transcription.
 TRANSCRIPT_AGGREGATION_DELAY = 0.1
 
+# Autonomous ("drain") finalization. The model emits text delay_in_frames
+# behind the audio, so once the server has stepped through delay_in_frames of
+# audio since the last text token AND its end-pointing signal saw no speech
+# in that window, the decoder lookahead is provably empty: nothing more can
+# arrive for the accumulated text. At that point the accumulated text is
+# finalized without waiting for a flush. This covers speech the local VAD
+# missed entirely (e.g. a quiet short "yes"), where no flush is ever sent and
+# the transcription would otherwise never finalize.
+FINALIZE_INACTIVITY_THRESHOLD = 0.9  # min-horizon inactivity_prob >= this counts as silence
+FINALIZE_MARGIN_STEPS = 2  # extra steps beyond delay_in_frames before finalizing
+
 
 def _input_format_from_encoding(encoding: str, sample_rate: int) -> str:
     """Build Gradium input_format from encoding type and sample rate.
@@ -156,6 +167,7 @@ class GradiumSTTService(WebsocketSTTService):
         json_config: str | None = None,
         settings: Settings | None = None,
         ttfs_p99_latency: float | None = GRADIUM_TTFS_P99,
+        autonomous_finalization: bool = True,
         **kwargs,
     ):
         """Initialize the Gradium STT service.
@@ -224,6 +236,11 @@ class GradiumSTTService(WebsocketSTTService):
             **kwargs,
         )
 
+        # When False, the service behaves exactly like the stock 1.7.0
+        # integration: transcriptions finalize only on a flush and are not
+        # marked finalized=True. A/B toggle for evaluating drain finalization.
+        self._autonomous_finalization = autonomous_finalization
+
         self._api_key = api_key
         self._api_endpoint_base_url = api_endpoint_base_url
         self._encoding = encoding
@@ -245,6 +262,12 @@ class GradiumSTTService(WebsocketSTTService):
         self._accumulated_text: list[str] = []
         self._flush_counter = 0
         self._transcript_aggregation_task: asyncio.Task | None = None
+
+        # Drain-based autonomous finalization state: flushes in flight (a
+        # pending flush will finalize on its own, so drain detection stands
+        # down) and consecutive silent steps since the last text token.
+        self._pending_flushes = 0
+        self._silent_steps = 0
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate metrics.
@@ -334,6 +357,7 @@ class GradiumSTTService(WebsocketSTTService):
         msg = {"type": "flush", "flush_id": flush_id}
         try:
             await self._websocket.send(json.dumps(msg))
+            self._pending_flushes += 1
         except Exception as e:
             logger.warning(f"Failed to send flush: {e}")
 
@@ -436,6 +460,8 @@ class GradiumSTTService(WebsocketSTTService):
 
         self._accumulated_text.clear()
         self._flush_counter = 0
+        self._pending_flushes = 0
+        self._silent_steps = 0
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -467,15 +493,72 @@ class GradiumSTTService(WebsocketSTTService):
                 logger.warning(f"Received non-JSON message: {message}")
                 continue
 
-            type_ = msg.get("type", "")
-            if type_ == "text":
-                await self._handle_text(msg["text"])
-            elif type_ == "flushed":
-                await self._handle_flushed()
-            elif type_ == "end_of_stream":
-                logger.debug("Received end_of_stream message from server")
-            elif type_ == "error":
-                await self.push_error(error_msg=f"Error: {msg}")
+            await self._handle_server_message(msg)
+
+    def _delay_in_frames(self) -> int:
+        """The configured decoder delay in 80ms steps (12 unless overridden)."""
+        delay = self._settings.delay_in_frames
+        return delay if isinstance(delay, int) else 12
+
+    async def _handle_server_message(self, msg: dict):
+        """Dispatch one decoded server message. Subclass hook point."""
+        type_ = msg.get("type", "")
+        if type_ == "text":
+            # A token attests speech delay_in_frames *ago*, not now: cap the
+            # silent-step counter to the steps that postdate that speech
+            # instead of zeroing it. A full reset would count the decoder
+            # delay twice and add ~1s of finalization latency; the cost of
+            # the cap is trusting the end-pointing signal on a window where
+            # the decoder may have just contradicted it.
+            self._silent_steps = min(self._silent_steps, self._delay_in_frames())
+            await self._handle_text(msg["text"])
+        elif type_ == "step":
+            await self._handle_step(msg)
+        elif type_ == "flushed":
+            self._pending_flushes = max(0, self._pending_flushes - 1)
+            await self._handle_flushed()
+        elif type_ == "end_of_stream":
+            logger.debug("Received end_of_stream message from server")
+        elif type_ == "error":
+            await self.push_error(error_msg=f"Error: {msg}")
+
+    async def _handle_step(self, msg: dict):
+        """Track server-side VAD steps and finalize once the decoder drains.
+
+        Each step reports the semantic VAD's inactivity probabilities for the
+        audio the server just consumed (the VAD signal is not delayed, unlike
+        text emission). After delay_in_frames (+ margin) consecutive silent
+        steps with no text arriving, nothing more can be in flight for the
+        accumulated transcription -- finalize it even though no flush was
+        sent. Text arrival caps the counter to the decoder delay (see
+        _handle_server_message).
+        """
+        if not self._autonomous_finalization:
+            return
+
+        # What the server calls "vad" is not an instantaneous VAD but a bank
+        # of end-pointing predictors: each entry is the probability that
+        # speech stays inactive over the next horizon_s seconds. We use the
+        # entry with the minimal horizon (0.5s in practice) as a VAD
+        # substitute: if the probability of inactivity over the shortest
+        # horizon is high, speech is not happening right now.
+        vad = msg.get("vad") or []
+        nearest = min(vad, key=lambda e: e.get("horizon_s", float("inf")), default=None)
+        inactivity = nearest.get("inactivity_prob", 0.0) if nearest else 0.0
+        if inactivity >= FINALIZE_INACTIVITY_THRESHOLD:
+            self._silent_steps += 1
+        else:
+            self._silent_steps = 0
+
+        if (
+            self._accumulated_text
+            and not self._pending_flushes
+            and not self._transcript_aggregation_task
+            and self._silent_steps >= self._delay_in_frames() + FINALIZE_MARGIN_STEPS
+        ):
+            self._silent_steps = 0
+            logger.debug("Drain finalization: decoder lookahead cleared in silence")
+            await self._finalize_accumulated_text()
 
     async def _handle_text(self, text: str):
         """Handle streaming transcription fragment.
@@ -530,12 +613,18 @@ class GradiumSTTService(WebsocketSTTService):
         # Report usage before the transcription frame so tracing can attach
         # it to the STT span the frame closes.
         await self.emit_stt_usage_metrics()
+        # Every finalization is drain-proven -- it runs either after the
+        # server's "flushed" ack (plus the aggregation delay) or after the
+        # decoder lookahead cleared in silence -- so the transcription is
+        # complete for the utterance and marked finalized. Downstream turn
+        # strategies use this to skip their STT safety-net timeout.
         await self.push_frame(
             TranscriptionFrame(
                 text,
                 self._user_id,
                 time_now_iso8601(),
                 language,
+                finalized=self._autonomous_finalization,
             )
         )
         await self._trace_transcription(text, is_final=True, language=language)
